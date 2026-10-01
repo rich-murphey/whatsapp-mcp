@@ -3015,6 +3015,12 @@ func main() {
 	maxRetries := 3
 	var connErr error
 
+	// Logged out: serve pairing codes until login (pair_code.go).
+	var pair *pairServer
+	if client.Store.ID == nil {
+		pair = startPairServer(client, port, bridgeToken, logger)
+	}
+
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		logger.Infof("Connection attempt %d/%d...", attempt, maxRetries)
 
@@ -3048,6 +3054,7 @@ func main() {
 			qrCodeShown := false
 			for evt := range qrChan {
 				if evt.Event == "code" {
+					pair.setReady(true)
 					if !qrCodeShown {
 						fmt.Println("\nScan this QR code with your WhatsApp app:")
 						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
@@ -3062,6 +3069,7 @@ func main() {
 					break
 				}
 			}
+			pair.setReady(false)
 
 			// Wait for connection with timeout
 			select {
@@ -3094,6 +3102,9 @@ func main() {
 	}
 
 connectionSuccess:
+	if pair != nil {
+		pair.stop()
+	}
 
 	// Wait a moment for connection to stabilize
 	time.Sleep(2 * time.Second)
