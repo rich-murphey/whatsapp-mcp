@@ -3132,9 +3132,9 @@ func main() {
 
 		case *events.LoggedOut:
 			logger.Warnf("⚠️  Device logged out, please scan QR code to log in again")
-			// QR codes and POST /api/pair-phone open only at startup, so exit and
-			// let the supervisor (systemd Restart=always) restart the bridge into
-			// pairing. whatsmeow deletes the session beside this event
+			// POST /api/pair-phone is served only from a logged-out start, so exit
+			// and let the supervisor (systemd Restart=always) restart the bridge
+			// into it. whatsmeow deletes the session beside this event
 			// (Store.Delete clears Store.ID): wait for that, so the restart
 			// starts logged out.
 			go func() {
@@ -3196,82 +3196,61 @@ func main() {
 	maxRetries := 3
 	var connErr error
 
-	// Logged out: serve pairing codes until login (pair_code.go).
+	// Logged out: hold no session with WhatsApp until a pairing code is asked
+	// for (pair_code.go), and then only for that pairing session.
 	var pair *pairServer
 	if client.Store.ID == nil {
-		pair = startPairServer(client, port, bridgeToken, logger)
+		// One pairing session: its QR codes, each printed for whatsapp-sync to
+		// post, and the window in which POST /api/pair-phone can issue a code.
+		// It ends on login or when the codes run out (about 160 s).
+		openPairing := func(pair *pairServer) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			qrChan, err := client.GetQRChannel(ctx)
+			if err != nil {
+				logger.Errorf("Failed to get QR channel: %v", err)
+				return
+			}
+			if err := client.Connect(); err != nil {
+				logger.Errorf("Failed to connect for pairing: %v", err)
+				return
+			}
+			// Print QR codes for pairing with the phone.
+			outcome := renderPairingQRCodes(qrChan, os.Stdout, func(code string, w io.Writer) {
+				pair.setReady(true) // a pairing session is open: codes can be issued
+				qrterminal.GenerateHalfBlock(code, qrterminal.L, w)
+			})
+			pair.setReady(false)
+			if outcome == pairingQRSucceeded {
+				connected <- true
+				return
+			}
+			if outcome == pairingQRTimedOut {
+				logger.Warnf("QR code timed out")
+			}
+			client.Disconnect()
+		}
+		pair = startPairServer(client, port, bridgeToken, logger, openPairing)
+		<-connected
+		fmt.Println("\nSuccessfully connected and authenticated!")
+		goto connectionSuccess
 	}
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		logger.Infof("Connection attempt %d/%d...", attempt, maxRetries)
 
-		// Connect to WhatsApp
-		if client.Store.ID == nil {
-			// No ID stored, this is a new client, need to pair with phone
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			defer cancel()
-
-			qrChan, connErr := client.GetQRChannel(ctx)
-			if connErr != nil {
-				logger.Errorf("Failed to get QR channel: %v", connErr)
-				if attempt == maxRetries {
-					return
-				}
-				time.Sleep(5 * time.Second)
-				continue
+		// Already logged in, just connect
+		connErr = client.Connect()
+		if connErr != nil {
+			logger.Errorf("Failed to connect (attempt %d): %v", attempt, connErr)
+			if attempt == maxRetries {
+				return
 			}
-
-			connErr = client.Connect()
-			if connErr != nil {
-				logger.Errorf("Failed to connect (attempt %d): %v", attempt, connErr)
-				if attempt == maxRetries {
-					return
-				}
-				time.Sleep(5 * time.Second)
-				continue
-			}
-
-			// Print QR codes for pairing with the phone.
-			switch renderPairingQRCodes(qrChan, os.Stdout, func(code string, w io.Writer) {
-				pair.setReady(true) // a pairing session is open: codes can be issued
-				qrterminal.GenerateHalfBlock(code, qrterminal.L, w)
-			}) {
-			case pairingQRSucceeded:
-				connected <- true
-			case pairingQRTimedOut:
-				logger.Warnf("QR code timed out")
-			case pairingQRChannelClosed:
-			}
-			pair.setReady(false)
-
-			// Wait for connection with timeout
-			select {
-			case <-connected:
-				fmt.Println("\nSuccessfully connected and authenticated!")
-				goto connectionSuccess
-			case <-ctx.Done():
-				logger.Errorf("Timeout waiting for QR code scan (attempt %d)", attempt)
-				client.Disconnect()
-				if attempt == maxRetries {
-					return
-				}
-				time.Sleep(10 * time.Second)
-				continue
-			}
-		} else {
-			// Already logged in, just connect
-			connErr = client.Connect()
-			if connErr != nil {
-				logger.Errorf("Failed to connect (attempt %d): %v", attempt, connErr)
-				if attempt == maxRetries {
-					return
-				}
-				time.Sleep(5 * time.Second)
-				continue
-			}
-			connected <- true
-			break
+			time.Sleep(5 * time.Second)
+			continue
 		}
+		connected <- true
+		break
 	}
 
 connectionSuccess:

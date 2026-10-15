@@ -22,11 +22,16 @@ import (
 //
 // A code is only good inside a pairing session: whatsmeow's PairPhone needs
 // the login websocket open, which lasts until its QR codes run out (160 s).
-// ready is set from the first QR event of an attempt until the attempt ends.
+// A logged-out bridge holds no session (Rich, 2026-10-15: "stay fully quiet
+// while unlinked"), so a request opens one with open, and waits for it.
+// ready is set from the first QR event of a session until the session ends;
+// running from when open is called until it returns.
 type pairServer struct {
-	mu    sync.Mutex
-	ready bool
-	srv   *http.Server
+	mu      sync.Mutex
+	ready   bool
+	running bool
+	open    func(*pairServer)
+	srv     *http.Server
 }
 
 type pairPhoneRequest struct {
@@ -39,8 +44,8 @@ type pairPhoneResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
-func startPairServer(client *whatsmeow.Client, port int, token string, logger waLog.Logger) *pairServer {
-	p := &pairServer{}
+func startPairServer(client *whatsmeow.Client, port int, token string, logger waLog.Logger, open func(*pairServer)) *pairServer {
+	p := &pairServer{open: open}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/pair-phone", withAuth(token, buildAllowedHosts(port), func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -63,8 +68,15 @@ func startPairServer(client *whatsmeow.Client, port int, token string, logger wa
 			return
 		}
 		if !p.isReady() {
-			reply(http.StatusConflict, pairPhoneResponse{Message: "no pairing session is open; try again in a few seconds"})
-			return
+			p.start()
+			// The first QR event marks the session open, a second or two in.
+			for i := 0; i < 150 && !p.isReady(); i++ {
+				time.Sleep(100 * time.Millisecond)
+			}
+			if !p.isReady() {
+				reply(http.StatusConflict, pairPhoneResponse{Message: "no pairing session is open; try again in a few seconds"})
+				return
+			}
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
@@ -88,14 +100,27 @@ func startPairServer(client *whatsmeow.Client, port int, token string, logger wa
 			logger.Errorf("Pairing endpoint error: %v", err)
 		}
 	}()
-	logger.Infof("Logged out: POST /api/pair-phone on %s issues a pairing code", p.srv.Addr)
+	logger.Infof("Logged out: POST /api/pair-phone on %s opens a pairing session and issues a code", p.srv.Addr)
 	return p
 }
 
-func (p *pairServer) setReady(ready bool) {
-	if p == nil { // logged in at start: no pairing server
+// start opens a pairing session unless one is already open or opening.
+func (p *pairServer) start() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.running {
 		return
 	}
+	p.running = true
+	go func() {
+		p.open(p)
+		p.mu.Lock()
+		p.running = false
+		p.mu.Unlock()
+	}()
+}
+
+func (p *pairServer) setReady(ready bool) {
 	p.mu.Lock()
 	p.ready = ready
 	p.mu.Unlock()
