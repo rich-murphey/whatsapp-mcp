@@ -3132,6 +3132,18 @@ func main() {
 
 		case *events.LoggedOut:
 			logger.Warnf("⚠️  Device logged out, please scan QR code to log in again")
+			// QR codes and POST /api/pair-phone open only at startup, so exit and
+			// let the supervisor (systemd Restart=always) restart the bridge into
+			// pairing. whatsmeow deletes the session beside this event
+			// (Store.Delete clears Store.ID): wait for that, so the restart
+			// starts logged out.
+			go func() {
+				for i := 0; i < 100 && client.Store.ID != nil; i++ {
+					time.Sleep(100 * time.Millisecond)
+				}
+				logger.Warnf("Exiting, so a restart opens a pairing session")
+				os.Exit(1)
+			}()
 
 		case *events.Disconnected:
 			logger.Warnf("⚠️  Disconnected from WhatsApp servers, will attempt reconnection...")
